@@ -43,31 +43,36 @@ NPU_MIN_RESPONSE_LEN = 256
 # everywhere would simply delete the NPU from the results. Listing FP16 last for
 # the NPU rather than omitting it means we still ATTEMPT it and record the real
 # error, instead of assuming.
-PREFERENCE = {
-    "CPU": ["qwen2.5-1.5b-fp32", "qwen2.5-1.5b-fp16",
-            "qwen2.5-1.5b-int8", "qwen2.5-1.5b-int4-asym-g128"],
-    "GPU": ["qwen2.5-1.5b-fp32", "qwen2.5-1.5b-fp16",
-            "qwen2.5-1.5b-int8", "qwen2.5-1.5b-int4-asym-g128"],
-    # NPU keeps int4-sym listed last as a documented escape hatch, but it is NOT
-    # exported by default -- so a default run never silently substitutes a
-    # quantised model. If only unquantized variants exist the NPU attempts them
-    # and we record the real outcome.
-    "NPU": ["qwen2.5-1.5b-fp32", "qwen2.5-1.5b-fp16", "qwen2.5-1.5b-int4-sym-cw"],
-}
-DRAFT_PREFERENCE = {
-    "CPU": ["qwen2.5-0.5b-fp32", "qwen2.5-0.5b-fp16", "qwen2.5-0.5b-int4-sym-cw"],
-    "GPU": ["qwen2.5-0.5b-fp32", "qwen2.5-0.5b-fp16", "qwen2.5-0.5b-int4-sym-cw"],
-    "NPU": ["qwen2.5-0.5b-fp32", "qwen2.5-0.5b-fp16", "qwen2.5-0.5b-int4-sym-cw"],
-}
+# Unquantized only, and the SAME model on every device.
+#
+# Giving different devices different models would make the comparison
+# meaningless: a device running a smaller model looks faster without being
+# faster. Every device gets fp32 if it is exported, else fp16 -- never a
+# compressed variant, and never a different one per device.
+PREFERENCE = ["qwen2.5-1.5b-fp32", "qwen2.5-1.5b-fp16"]
 
 
-def pick_model(kind: str, models: dict, draft: bool = False) -> str | None:
-    """First exported variant this device kind can actually use, or None."""
-    table = DRAFT_PREFERENCE if draft else PREFERENCE
-    for key in table.get(kind.upper(), []):
+def pick_model(kind: str, models: dict) -> str | None:
+    """First exported variant available, identical across devices.
+
+    Used by the multi-device strategies, where sweeping precision too would
+    multiply an already large config count for little extra insight.
+    """
+    for key in PREFERENCE:
         if key in models:
             return key
     return None
+
+
+def all_models(models: dict) -> list[str]:
+    """Every exported unquantized variant, in PREFERENCE order.
+
+    The core per-device strategies sweep ALL of these, because fp32-vs-fp16 is
+    itself one of the measurements: it separates "what precision does this
+    silicon execute natively" from "how many bytes must cross the memory bus".
+    Those two effects are easy to confuse and only a side-by-side separates them.
+    """
+    return [k for k in PREFERENCE if k in models]
 
 
 def resolve(kind: str) -> str:
@@ -182,10 +187,8 @@ class SingleDevice:
         for kind in ("CPU", "GPU", "NPU"):
             if kind not in available:
                 continue
-            key = pick_model(kind, models)
-            if key is None:
-                continue
-            out.append({"device": kind, "model_key": key})
+            for key in all_models(models):     # fp32 AND fp16, both measured
+                out.append({"device": kind, "model_key": key})
         return out
 
     @staticmethod
@@ -210,94 +213,81 @@ class SingleDevice:
 # 2. Speculative decoding  -- the key experiment
 # --------------------------------------------------------------------------
 
-class Speculative:
-    """0.5B draft proposes, 1.5B target verifies in one batched pass.
+class PrefillScaling:
+    """Prompt-length sweep: measures the COMPUTE-bound regime.
 
-    This is the ONE mechanism that beats the bandwidth wall on a single stream:
-    the target model's weights are swept once per *verification round* rather
-    than once per token, so k accepted tokens cost one sweep instead of k.
+    Decode and prefill stress completely different parts of the machine, and
+    measuring only decode characterises only half the hardware:
 
-    It only pays when draft latency is small relative to target verification.
-    Prior art (openvino#36484, Lunar Lake) found NPU-drafting was a net LOSS
-    (0.55-0.74x) while CPU-drafting won (1.35x) -- but that was NPU 3 at 13 TOPS.
-    The cloud node here is NPU 5 at ~50 TOPS, so that result may invert. That is
-    the open question this strategy exists to answer.
+      decode   one token at a time, streams all weights per token
+               -> MEMORY-BANDWIDTH bound. Compute sits idle.
+      prefill  whole prompt at once, weights reused across all prompt positions
+               -> COMPUTE bound. This is where TOPS actually shows up.
 
-    Report acceptance_rate and throughput SEPARATELY: a low acceptance rate means
-    the draft is bad, a high acceptance rate with low throughput means the draft
-    is too slow to amortise. Different problems, different fixes.
+    So this is the strategy that can reveal an NPU's arithmetic throughput. A
+    device with 50 TOPS and a device with 5 TOPS look nearly identical on decode
+    -- both are waiting on DRAM -- and separate by a wide margin here.
+
+    Reported as prompt tokens/second (prompt_len / TTFT), swept across prompt
+    lengths so the scaling curve is visible rather than a single point. Flat
+    scaling with length means compute-bound; linear degradation means something
+    else dominates.
     """
 
-    name = "spec"
+    name = "prefill"
+
+    # Kept inside the NPU's default static MAX_PROMPT_LEN of 1024.
+    PROMPT_TOKENS = (64, 256, 512, 960)
 
     @staticmethod
     def configs(available: set[str], models: dict) -> list[dict]:
         out = []
-        for main in ("GPU", "CPU", "NPU"):
-            if main not in available:
+        for kind in ("CPU", "GPU", "NPU"):
+            if kind not in available:
                 continue
-            main_key = pick_model(main, models)
-            if main_key is None:
-                continue
-            for draft in ("CPU", "NPU", "GPU"):
-                if draft not in available or draft == main:
-                    continue
-                draft_key = pick_model(draft, models, draft=True)
-                if draft_key is None:
-                    continue
-                for nat in (1, 3, 5):
-                    out.append({"main": main, "draft": draft,
-                                "model_key": main_key, "draft_key": draft_key,
-                                "num_assistant_tokens": nat})
+            for key in all_models(models):
+                for n in PrefillScaling.PROMPT_TOKENS:
+                    out.append({"device": kind, "model_key": key,
+                                "prompt_tokens": n})
         return out
 
     @staticmethod
     def run(cfg: dict, models: dict) -> RunResult:
         import openvino_genai as ov_genai
 
-        main, draft = cfg["main"], cfg["draft"]
-        nat = cfg["num_assistant_tokens"]
-        devices = f"main={main},draft={draft}"
-        label = f"{main}<-{draft} nat={nat}"
+        dev, n = cfg["device"], cfg["prompt_tokens"]
+        dev_str = resolve(dev)
+        prec = cfg["model_key"].rsplit("-", 1)[-1]      # fp32 / fp16
+        label = f"{dev} {prec} prefill {n} tok"
         try:
+            # Build a prompt of approximately n tokens. Exact length is measured
+            # afterwards from perf_metrics rather than assumed -- the tokenizer,
+            # not us, decides how many tokens a string becomes.
+            unit = "The system streams weights from memory for every token. "
+            prompt = (unit * ((n // 10) + 2))[:n * 5]
+
             t0 = time.perf_counter()
-            draft_model = ov_genai.draft_model(
-                models[cfg["draft_key"]], resolve(draft), **device_props(draft))
-            pipe = ov_genai.LLMPipeline(
-                models[cfg["model_key"]], resolve(main),
-                draft_model=draft_model, **device_props(main))
+            pipe = ov_genai.LLMPipeline(models[cfg["model_key"]], dev_str,
+                                        **device_props(dev))
             compile_s = time.perf_counter() - t0
 
-            # NOTE: no scheduler_config here. The stateful speculative pipeline is
-            # required for NPU drafting and passing a scheduler_config errors out.
-            res = pipe.generate([PROMPT], _gen_config(num_assistant_tokens=nat))
-            out = _collect(res, compile_s, "spec", label, devices)
-            out.extra["num_assistant_tokens"] = nat
-
-            # Acceptance rate lives on extended_perf_metrics (SDPerModelsPerfMetrics)
-            # for speculative pipelines, but the exact accessor moves between
-            # versions. Try several, and never let a missing metric fail an
-            # otherwise-good run -- throughput is still valid without it.
-            for holder in (getattr(res, "extended_perf_metrics", None),
-                           getattr(res, "perf_metrics", None)):
-                if holder is None:
-                    continue
-                for attr in ("get_acceptance_rate", "acceptance_rate",
-                             "get_avg_acceptance_rate"):
-                    try:
-                        v = getattr(holder, attr)
-                        v = v() if callable(v) else v
-                        v = getattr(v, "mean", v)
-                        if isinstance(v, (int, float)):
-                            out.acceptance_rate = float(v)
-                            break
-                    except Exception:
-                        continue
-                if not math.isnan(out.acceptance_rate):
-                    break
+            # Generate a single token: TTFT is then essentially pure prefill.
+            res = pipe.generate([prompt], _gen_config(max_new_tokens=1))
+            out = _collect(res, compile_s, "prefill", label, dev_str)
+            pm = res.perf_metrics
+            try:
+                in_tok = pm.get_num_input_tokens()
+                ttft_s = pm.get_ttft().mean / 1000.0
+                out.extra["input_tokens"] = in_tok
+                out.extra["prefill_tok_per_s"] = (in_tok / ttft_s) if ttft_s else None
+                # Report prefill rate in the throughput column so it ranks in
+                # the summary table alongside everything else.
+                out.throughput_tok_s = (in_tok / ttft_s) if ttft_s else NAN
+            except Exception as e:
+                out.extra["prefill_metrics_error"] = str(e)
             return out
         except Exception as e:
-            return RunResult("spec", label, devices, ok=False,
+            return RunResult("prefill", label, dev_str, ok=False,
                              error=f"{type(e).__name__}: {e}")
 
 
@@ -608,6 +598,9 @@ class Distributed:
                              error=f"{type(e).__name__}: {e}")
 
 
-ALL = [SingleDevice, Speculative, PrefillDecodeSplit,
+# No Speculative, no quantised variants anywhere. Every strategy here runs the
+# SAME unmodified fp32 model, so differences between rows are differences in the
+# hardware and the runtime -- not in the workload.
+ALL = [SingleDevice, PrefillScaling, PrefillDecodeSplit,
        ConcurrentStreams, CpuThreadPartition, Hetero, Distributed]
 BY_NAME = {s.name: s for s in ALL}

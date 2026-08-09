@@ -1,19 +1,19 @@
 """Model export to OpenVINO IR.
 
-FP16 is the primary target. The quantised variants are kept as comparison points
-and because the NPU needs one.
+UNQUANTIZED ONLY, by design.
 
-  fp16            PRIMARY. Full-precision weights, ~3.1 GB for the 1.5B model.
-                  Highest quality, and the reference the others are judged
-                  against. Note the cost: decode streams every weight byte once
-                  per token, so 3.1 GB/token versus INT4's ~1.0 GB means roughly
-                  3x lower token rate on the same memory bandwidth. That is
-                  physics, not a defect -- see bench/roofline.py.
-  int8            ~1.6 GB. The usual quality/bandwidth compromise.
-  int4-asym-g128  ~1.0 GB. Fastest on CPU/GPU; asymmetric per-group.
-  int4-sym-cw     ~1.0 GB. NPU-legal form -- the NPU rejects asymmetric
-                  per-group INT4, so it needs symmetric channel-wise (-1).
-  0.5B drafts     Speculative-decoding drafts, in fp16 and in NPU-legal int4.
+This harness measures what the hardware does on a fixed, unmodified workload.
+Quantisation changes the workload -- it makes the model smaller, which raises
+tok/s on a bandwidth-bound decode without the silicon having become any faster.
+That is a real deployment technique, but it is not a measurement of the machine,
+so it has no place here. Same reasoning excludes speculative decoding.
+
+  fp32   ~6.2 GB for the 1.5B model. Full precision. The CPU executes this
+         natively; the NPU's hardware compute precision is fp16, so on that
+         device an fp32 IR is converted down regardless of the file's contents.
+  fp16   ~3.1 GB. Half precision, still unquantized -- no weight compression,
+         no scales, no zero points. Included because it is what the GPU and NPU
+         execute in natively, so it isolates "precision" from "compression".
 
 Exports are idempotent: an existing directory containing openvino_model.xml is
 left alone unless --force.
@@ -49,43 +49,20 @@ class Variant:
 
 VARIANTS: dict[str, Variant] = {
     v.key: v for v in [
-        # --- unquantized ---
         Variant("qwen2.5-1.5b-fp32", TARGET_ID,
                 ["--weight-format", "fp32"],
-                "FULL precision, no compression (~6.2 GB)"),
-        Variant("qwen2.5-0.5b-fp32", DRAFT_ID,
-                ["--weight-format", "fp32"],
-                "speculative draft, full precision (~2.0 GB)"),
+                "full precision, no compression (~6.2 GB)"),
         Variant("qwen2.5-1.5b-fp16", TARGET_ID,
                 ["--weight-format", "fp16"],
-                "half precision, still unquantized (~3.1 GB)"),
-        Variant("qwen2.5-0.5b-fp16", DRAFT_ID,
-                ["--weight-format", "fp16"],
-                "speculative draft, unquantized (~1.0 GB)"),
-        # --- comparison / NPU-required ---
-        Variant("qwen2.5-1.5b-int8", TARGET_ID,
-                ["--weight-format", "int8"],
-                "comparison + accuracy anchor"),
-        Variant("qwen2.5-1.5b-int4-asym-g128", TARGET_ID,
-                ["--weight-format", "int4", "--group-size", "128", "--ratio", "1.0"],
-                "comparison, fastest on CPU/GPU"),
-        Variant("qwen2.5-1.5b-int4-sym-cw", TARGET_ID,
-                ["--weight-format", "int4", "--sym", "--group-size", "-1", "--ratio", "1.0"],
-                "NPU-legal target (sym channel-wise)"),
-        Variant("qwen2.5-0.5b-int4-sym-cw", DRAFT_ID,
-                ["--weight-format", "int4", "--sym", "--group-size", "-1", "--ratio", "1.0"],
-                "NPU-legal draft"),
+                "half precision, no compression (~3.1 GB)"),
     ]
 }
 
-# Exported by default: the UNQUANTIZED pair. The quantised variants are opt-in
-# via --only or --all, so a default run never produces a compressed model.
-#
-# Note on FP32: the weights are genuinely fp32 on disk (~6.2 GB), but what each
-# device *executes* in is a separate question. The CPU can run fp32 natively;
-# the NPU's hardware compute precision is fp16, so an fp32 IR is converted down
-# on that device regardless of what the file contains.
-DEFAULT_KEYS = ["qwen2.5-1.5b-fp32", "qwen2.5-0.5b-fp32"]
+TARGET_ID_ONLY = TARGET_ID  # no draft model: speculative decoding is out of scope
+
+# FP32 is the default. FP16 is opt-in via --all, for the precision-vs-compression
+# comparison; neither is quantised.
+DEFAULT_KEYS = ["qwen2.5-1.5b-fp32"]
 
 
 def is_exported(path: str) -> bool:
@@ -127,39 +104,6 @@ def size_bytes(path: str) -> int:
     return total
 
 
-def check_tokenizers_identical(a: str, b: str) -> tuple[bool, str]:
-    """Speculative decoding is only valid if draft and target share a token space.
-
-    A mismatch does not crash -- it silently produces a near-zero acceptance rate
-    and plausible-looking but wrong output, which is far more expensive to debug
-    later than to assert now.
-    """
-    try:
-        from transformers import AutoTokenizer
-    except ImportError:
-        return False, "transformers not installed; cannot verify"
-
-    try:
-        ta = AutoTokenizer.from_pretrained(a)
-        tb = AutoTokenizer.from_pretrained(b)
-    except Exception as e:
-        return False, f"failed to load tokenizers: {e}"
-
-    va, vb = ta.get_vocab(), tb.get_vocab()
-    if va != vb:
-        only_a = set(va) - set(vb)
-        only_b = set(vb) - set(va)
-        return False, (f"vocab differs: {len(va)} vs {len(vb)} entries, "
-                       f"{len(only_a)} only-in-target, {len(only_b)} only-in-draft")
-
-    probe = ("The quick brown fox jumps over the lazy dog. "
-             "def f(x):\n    return x**2  # 1234567890 你好世界")
-    ia, ib = ta.encode(probe), tb.encode(probe)
-    if ia != ib:
-        return False, "identical vocab but different encoding of probe string"
-    return True, f"identical ({len(va)} tokens, probe -> {len(ia)} ids)"
-
-
 def main() -> int:
     ap = argparse.ArgumentParser(description="Export Qwen2.5 variants to OpenVINO IR.")
     ap.add_argument("--only", nargs="*", choices=sorted(VARIANTS), help="subset to export")
@@ -199,22 +143,6 @@ def main() -> int:
             manifest[k] = {"path": v.path, "bytes": b, "gb": round(b / 1e9, 3),
                            "model_id": v.model_id, "note": v.note}
             print(f"{k:32s} {b / 1e9:6.2f} GB")
-
-    # Check the tokenizers of whichever target/draft pair actually got exported.
-    pairs = [("qwen2.5-1.5b-fp16", "qwen2.5-0.5b-fp16"),
-             ("qwen2.5-1.5b-int4-sym-cw", "qwen2.5-0.5b-int4-sym-cw")]
-    tgt = drf = None
-    for tk, dk in pairs:
-        if is_exported(VARIANTS[tk].path) and is_exported(VARIANTS[dk].path):
-            tgt, drf = VARIANTS[tk].path, VARIANTS[dk].path
-            break
-    if tgt and drf:
-        same, why = check_tokenizers_identical(tgt, drf)
-        print(f"\ntokenizer identity (target vs draft): {'OK' if same else 'MISMATCH'} - {why}")
-        manifest["_tokenizer_check"] = {"identical": same, "detail": why}
-        if not same:
-            print("  -> speculative-decoding results would be meaningless. Fix before Phase 2.")
-            ok = False
 
     if manifest:
         os.makedirs(MODELS, exist_ok=True)

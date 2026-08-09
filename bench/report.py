@@ -36,22 +36,54 @@ def _f(row: dict, key: str):
         return None
 
 
-def load_roofline(path: str | None, model_dir: str | None):
-    """Return (tok_s_ceiling, description) or (None, why-not)."""
+def load_peak_bandwidth(path: str | None):
+    """Achieved GB/s from a roofline JSON, or None."""
     if path and os.path.isfile(path):
-        with open(path) as f:
-            d = json.load(f)
-        if "tok_s_ceiling" in d:
-            return d["tok_s_ceiling"], (
-                f"{d.get('peak_gb_per_s', 0):.0f} GB/s over "
-                f"{d.get('model_bytes', 0) / 1e9:.2f} GB")
-        if "peak_gb_per_s" in d and model_dir:
-            from bench.roofline import dir_bytes, token_ceiling
-            mb = dir_bytes(model_dir)
-            if mb:
-                return token_ceiling(mb, d["peak_gb_per_s"]), (
-                    f"{d['peak_gb_per_s']:.0f} GB/s over {mb / 1e9:.2f} GB")
-    return None, "no roofline measured (run bench/roofline.py --model ... --json ...)"
+        try:
+            with open(path) as f:
+                return json.load(f).get("peak_gb_per_s")
+        except Exception:
+            pass
+    return None
+
+
+def model_sizes(root: str) -> dict[str, int]:
+    """Bytes per exported variant, keyed by directory name.
+
+    Needed because fp32 and fp16 have DIFFERENT ceilings on the same machine --
+    the bandwidth is shared but the bytes-per-token are not. Applying one
+    ceiling to both would understate fp16 and overstate fp32, which is exactly
+    the confusion this column exists to prevent.
+    """
+    out = {}
+    mdir = os.path.join(root, "models")
+    if not os.path.isdir(mdir):
+        return out
+    for name in os.listdir(mdir):
+        p = os.path.join(mdir, name)
+        if os.path.isfile(os.path.join(p, "openvino_model.xml")):
+            total = 0
+            for r, _, files in os.walk(p):
+                for f in files:
+                    if f.endswith((".bin", ".xml")):
+                        total += os.path.getsize(os.path.join(r, f))
+            out[name] = total
+    return out
+
+
+def row_ceiling(row: dict, peak_gb_s, sizes: dict[str, int]):
+    """Per-row ceiling, derived from the variant that row actually ran."""
+    if not peak_gb_s:
+        return None
+    try:
+        cfg = json.loads(row.get("config") or "{}")
+    except Exception:
+        return None
+    key = cfg.get("model_key")
+    b = sizes.get(key)
+    if not b:
+        return None
+    return peak_gb_s * 1e9 / b
 
 
 def main() -> int:
@@ -71,14 +103,21 @@ def main() -> int:
         path = found[-1]
 
     rf_path = args.roofline or os.path.join(root, "results", "roofline.json")
-    ceiling, ceil_desc = load_roofline(rf_path, args.model)
+    peak = load_peak_bandwidth(rf_path)
+    sizes = model_sizes(root)
 
     with open(path, newline="", encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
 
-    print(f"source  : {path}")
-    print(f"ceiling : "
-          + (f"{ceiling:.1f} tok/s  ({ceil_desc})" if ceiling else ceil_desc))
+    print(f"source    : {path}")
+    if peak:
+        print(f"bandwidth : {peak:.1f} GB/s measured")
+        for k in sorted(sizes):
+            print(f"  {k:28s} {sizes[k] / 1e9:5.2f} GB "
+                  f"-> ceiling {peak * 1e9 / sizes[k]:6.1f} tok/s")
+    else:
+        print("bandwidth : not measured "
+              "(run bench/roofline.py --json results/roofline.json)")
     print()
 
     ok = [r for r in rows if str(r.get("ok", "")).lower() == "true"]
@@ -99,7 +138,11 @@ def main() -> int:
         agg = _f(r, "aggregate_tok_s_mean")
         shown = agg if agg else tp
         sd = _f(r, "aggregate_tok_s_stdev") if agg else _f(r, "throughput_tok_s_stdev")
-        pct = (100.0 * shown / ceiling) if (ceiling and shown) else None
+        ceiling = row_ceiling(r, peak, sizes)
+        # Prefill rows are compute-bound, so a memory-bandwidth ceiling does not
+        # apply to them -- showing one would invite a meaningless comparison.
+        is_prefill = r.get("strategy") == "prefill"
+        pct = (100.0 * shown / ceiling) if (ceiling and shown and not is_prefill) else None
         acc = _f(r, "acceptance_rate_mean")
         ttft = _f(r, "ttft_ms_mean")
         tpot = _f(r, "tpot_ms_mean")
@@ -129,20 +172,32 @@ def main() -> int:
         print("  are expected to fail on some configurations, and knowing exactly")
         print("  how they fail is part of the result.")
 
-    if ceiling and ok:
-        best = ok[0]
-        v = _f(best, "aggregate_tok_s_mean") or _f(best, "throughput_tok_s_mean")
-        if v:
-            pct = 100.0 * v / ceiling
+    decode = [r for r in ok if r.get("strategy") in ("single", "cpu_threads")]
+    if peak and decode:
+        best = decode[0]
+        v = _f(best, "throughput_tok_s_mean")
+        c = row_ceiling(best, peak, sizes)
+        if v and c:
+            pct = 100.0 * v / c
             print()
+            print(f"Best decode config: {best.get('label', '')} at {pct:.0f}% of its "
+                  f"bandwidth ceiling.")
             if pct > 80:
-                print(f"Best config is at {pct:.0f}% of the bandwidth ceiling: this workload")
-                print("is memory-bound. Kernel tuning will not move it meaningfully --")
-                print("reduce bytes per token instead (quantisation, speculative decoding).")
+                print("That is memory-bound. The silicon is delivering essentially all the")
+                print("bandwidth it has; kernel tuning cannot move it. The only remaining")
+                print("levers change the workload rather than the machine.")
             elif pct < 40:
-                print(f"Best config is only at {pct:.0f}% of the bandwidth ceiling: there is")
-                print("real headroom. Run bench/kernels.py to check for reference-kernel")
-                print("fallbacks before doing anything more elaborate.")
+                print("There is real headroom here -- the machine is not bandwidth-limited")
+                print("at this point. Run bench/kernels.py to check for reference-kernel")
+                print("fallbacks before concluding anything about the hardware.")
+
+    prefill = [r for r in ok if r.get("strategy") == "prefill"]
+    if prefill:
+        print()
+        print("Prefill rows measure the COMPUTE-bound regime (prompt tokens/s) and are")
+        print("not subject to the decode bandwidth ceiling. This is where a high-TOPS")
+        print("device separates from a low-TOPS one; on decode they look alike because")
+        print("both are waiting on DRAM.")
     return 0
 
 
