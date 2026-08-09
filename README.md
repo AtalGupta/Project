@@ -4,23 +4,37 @@ A harness for running Qwen2.5-1.5B across every compute engine an Intel client
 machine has, and for finding out which combination is actually fastest — rather
 than assuming that using more engines is better.
 
-Primary model format is **FP16**. Quantised variants are available for
-comparison and because the NPU requires one.
+**Unquantized only: FP32 and FP16.** No INT8, no INT4, no speculative decoding.
 
-## The one thing to understand first
+That exclusion is deliberate. Both techniques raise tok/s by *changing the
+workload* — quantisation makes the model smaller, speculative decoding produces
+several tokens per weight sweep — without the silicon having become any faster.
+They are legitimate deployment techniques and useless as measurements. This
+harness answers "what does this hardware do", so every strategy runs the same
+unmodified model.
 
-LLM *decode* is **memory-bandwidth bound**, not compute bound. Generating one
-token requires streaming the entire weight set from DRAM:
+## The two regimes, and why both are measured
+
+An LLM has two phases with opposite bottlenecks. Measuring only one
+characterises half the machine.
+
+**Decode is memory-bandwidth bound.** Each token streams the entire weight set
+from DRAM:
 
 | Format | Qwen2.5-1.5B weights | Bytes per token |
 |---|---|---|
+| FP32 | ~6.2 GB | ~6.2 GB |
 | FP16 | ~3.1 GB | ~3.1 GB |
-| INT8 | ~1.6 GB | ~1.6 GB |
-| INT4 | ~1.0 GB | ~1.0 GB |
 
-So the token-rate ceiling is `achieved_bandwidth / model_bytes`. At ~100 GB/s
-that is ~32 tok/s for FP16 and ~100 tok/s for INT4, regardless of how much
-compute is available.
+The ceiling is `achieved_bandwidth / model_bytes` — so FP32 costs roughly half
+the token rate of FP16 on identical hardware. Compute sits idle here; a 50 TOPS
+device and a 5 TOPS device both just wait on DRAM.
+
+**Prefill is compute bound.** The whole prompt is processed at once and weights
+are reused across every prompt position, so arithmetic throughput dominates.
+This is the regime where TOPS actually shows up, and where devices that look
+identical on decode separate widely. Measured by `bench/prefill` as prompt
+tokens/second across a prompt-length sweep.
 
 On Intel client parts the CPU, integrated GPU and NPU **share one memory
 controller** and have no dedicated VRAM. Two consequences follow, and they shape
@@ -91,21 +105,35 @@ python -m bench.report
 
 ## Strategies
 
-| Name | What it does | Expectation |
+| Name | What it does | Regime |
 |---|---|---|
-| `single` | Whole model on one engine | Baseline for everything else |
-| `spec` | 0.5B draft + 1.5B target, across device pairs | **The key experiment** — the only mechanism that beats the bandwidth wall on a single stream |
-| `prefill_split` | Best prefill device + best decode device | **Upper bound probe, not an implementation** — GenAI cannot split one pipeline across devices |
-| `concurrent` | One pipeline per device, simultaneously | Best aggregate throughput; saturates at the roofline |
-| `cpu_threads` | CPU thread-count sweep | Finds where CPU threads start *stealing* bandwidth from other engines |
-| `hetero` | Op-level graph split via HETERO | Expected to **lose**; measured so the claim has a number behind it |
+| `single` | Whole model on one engine, FP32 **and** FP16 | Decode — the baseline everything else is judged against |
+| `prefill` | Prompt-length sweep, prompt tokens/s | **Compute** — where TOPS shows up |
+| `cpu_threads` | CPU thread-count sweep | Decode — finds where threads stop buying bandwidth |
+| `concurrent` | One pipeline per device, simultaneously | Aggregate — the honest "use all the hardware" |
+| `prefill_split` | Best prefill device + best decode device | Upper-bound probe, **not** an implementation |
+| `hetero` | Op-level split via `HETERO:A,B`, both orders | Expected to lose — measured anyway |
+| `distributed` | `PIPELINE_PARALLEL` / `TENSOR_PARALLEL` | Expected to lose — measured anyway |
 
-On `spec`: prior art ([openvino#36484](https://github.com/openvinotoolkit/openvino/discussions/36484))
-found NPU-drafting was a net loss (0.55–0.74×) while CPU-drafting won (1.35×) —
-but that was NPU 3 at 13 TOPS. On newer NPUs this may invert. Acceptance rate and
-throughput are reported separately because they diagnose different failures: low
-acceptance means a bad draft, high acceptance with low throughput means the draft
-is too slow to amortise.
+### Why splitting one model across devices does not speed up decode
+
+A transformer forward pass is a **serial dependency chain**: layer N+1 consumes
+layer N's output. Splitting that chain across devices adds transfers without
+creating concurrency.
+
+- `HETERO:A,B` assigns ops by *affinity* and runs subgraphs **sequentially**. It
+  is a fallback mechanism, not a parallelism one.
+- `PIPELINE_PARALLEL` puts stages on different devices but executes them **one
+  by one**; overlap requires multiple requests in flight.
+- `TENSOR_PARALLEL` is a genuine intra-op split, but is documented for CPU
+  sockets/NUMA and multi-GPU — CPU+NPU is not a documented combination.
+
+`hetero` and `distributed` are measured regardless, in both device orders, so
+the claim rests on numbers from the machine rather than on documentation.
+
+The one strategy that genuinely uses two engines at once is `concurrent`, and it
+raises *aggregate* throughput across independent requests — never single-stream
+latency.
 
 ## Measurement hygiene
 
