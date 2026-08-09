@@ -49,13 +49,19 @@ class Variant:
 
 VARIANTS: dict[str, Variant] = {
     v.key: v for v in [
-        # --- primary ---
+        # --- unquantized ---
+        Variant("qwen2.5-1.5b-fp32", TARGET_ID,
+                ["--weight-format", "fp32"],
+                "FULL precision, no compression (~6.2 GB)"),
+        Variant("qwen2.5-0.5b-fp32", DRAFT_ID,
+                ["--weight-format", "fp32"],
+                "speculative draft, full precision (~2.0 GB)"),
         Variant("qwen2.5-1.5b-fp16", TARGET_ID,
                 ["--weight-format", "fp16"],
-                "PRIMARY target, full precision (~3.1 GB)"),
+                "half precision, still unquantized (~3.1 GB)"),
         Variant("qwen2.5-0.5b-fp16", DRAFT_ID,
                 ["--weight-format", "fp16"],
-                "speculative draft, full precision (~1.0 GB)"),
+                "speculative draft, unquantized (~1.0 GB)"),
         # --- comparison / NPU-required ---
         Variant("qwen2.5-1.5b-int8", TARGET_ID,
                 ["--weight-format", "int8"],
@@ -72,9 +78,14 @@ VARIANTS: dict[str, Variant] = {
     ]
 }
 
-# Exported by default: the FP16 pair, which is what was asked for. The quantised
-# variants are opt-in via --only or --all.
-DEFAULT_KEYS = ["qwen2.5-1.5b-fp16", "qwen2.5-0.5b-fp16"]
+# Exported by default: the UNQUANTIZED pair. The quantised variants are opt-in
+# via --only or --all, so a default run never produces a compressed model.
+#
+# Note on FP32: the weights are genuinely fp32 on disk (~6.2 GB), but what each
+# device *executes* in is a separate question. The CPU can run fp32 natively;
+# the NPU's hardware compute precision is fp16, so an fp32 IR is converted down
+# on that device regardless of what the file contains.
+DEFAULT_KEYS = ["qwen2.5-1.5b-fp32", "qwen2.5-0.5b-fp32"]
 
 
 def is_exported(path: str) -> bool:

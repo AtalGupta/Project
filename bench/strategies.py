@@ -44,14 +44,20 @@ NPU_MIN_RESPONSE_LEN = 256
 # the NPU rather than omitting it means we still ATTEMPT it and record the real
 # error, instead of assuming.
 PREFERENCE = {
-    "CPU": ["qwen2.5-1.5b-fp16", "qwen2.5-1.5b-int8", "qwen2.5-1.5b-int4-asym-g128"],
-    "GPU": ["qwen2.5-1.5b-fp16", "qwen2.5-1.5b-int8", "qwen2.5-1.5b-int4-asym-g128"],
-    "NPU": ["qwen2.5-1.5b-int4-sym-cw", "qwen2.5-1.5b-int8", "qwen2.5-1.5b-fp16"],
+    "CPU": ["qwen2.5-1.5b-fp32", "qwen2.5-1.5b-fp16",
+            "qwen2.5-1.5b-int8", "qwen2.5-1.5b-int4-asym-g128"],
+    "GPU": ["qwen2.5-1.5b-fp32", "qwen2.5-1.5b-fp16",
+            "qwen2.5-1.5b-int8", "qwen2.5-1.5b-int4-asym-g128"],
+    # NPU keeps int4-sym listed last as a documented escape hatch, but it is NOT
+    # exported by default -- so a default run never silently substitutes a
+    # quantised model. If only unquantized variants exist the NPU attempts them
+    # and we record the real outcome.
+    "NPU": ["qwen2.5-1.5b-fp32", "qwen2.5-1.5b-fp16", "qwen2.5-1.5b-int4-sym-cw"],
 }
 DRAFT_PREFERENCE = {
-    "CPU": ["qwen2.5-0.5b-fp16", "qwen2.5-0.5b-int4-sym-cw"],
-    "GPU": ["qwen2.5-0.5b-fp16", "qwen2.5-0.5b-int4-sym-cw"],
-    "NPU": ["qwen2.5-0.5b-int4-sym-cw", "qwen2.5-0.5b-fp16"],
+    "CPU": ["qwen2.5-0.5b-fp32", "qwen2.5-0.5b-fp16", "qwen2.5-0.5b-int4-sym-cw"],
+    "GPU": ["qwen2.5-0.5b-fp32", "qwen2.5-0.5b-fp16", "qwen2.5-0.5b-int4-sym-cw"],
+    "NPU": ["qwen2.5-0.5b-fp32", "qwen2.5-0.5b-fp16", "qwen2.5-0.5b-int4-sym-cw"],
 }
 
 
@@ -508,13 +514,15 @@ class Hetero:
 
     @staticmethod
     def configs(available: set[str], models: dict) -> list[dict]:
-        prio = [d for d in ("GPU", "CPU") if d in available]
-        if len(prio) < 2:
-            return []
-        key = pick_model("GPU", models)
-        if key is None:
-            return []
-        return [{"order": prio, "model_key": key}]
+        # Try every ordered pair that exists, including NPU-first. Device order
+        # matters to HETERO: the first device gets every op it can claim.
+        out = []
+        for a, b in (("GPU", "CPU"), ("NPU", "CPU"), ("CPU", "NPU"), ("GPU", "NPU")):
+            if a in available and b in available:
+                key = pick_model(a, models) or pick_model(b, models)
+                if key:
+                    out.append({"order": [a, b], "model_key": key})
+        return out
 
     @staticmethod
     def run(cfg: dict, models: dict) -> RunResult:
@@ -533,6 +541,73 @@ class Hetero:
                              error=f"{type(e).__name__}: {e}")
 
 
+# --------------------------------------------------------------------------
+# 7. Model distribution policy  (PIPELINE_PARALLEL / TENSOR_PARALLEL)
+# --------------------------------------------------------------------------
+
+class Distributed:
+    """Split ONE model across two devices via ov::hint::model_distribution_policy.
+
+    This is OpenVINO's actual facility for distributing a single model, and it is
+    the closest thing to "run ops on CPU and NPU together". Two policies exist
+    and they are not equivalent:
+
+      PIPELINE_PARALLEL  stages assigned to different devices, executed ONE BY
+                         ONE. Devices only overlap when several requests are in
+                         flight. For single-stream autoregressive decode there
+                         is nothing to overlap, so no speedup is expected -- its
+                         real purpose is fitting a model that does not fit on
+                         one device.
+      TENSOR_PARALLEL    genuine intra-op split, devices work on one tensor
+                         simultaneously. Documented for CPU sockets/NUMA and
+                         multiple GPUs; CPU+NPU is not a documented combination.
+
+    Why single-stream decode cannot win here regardless of policy: a transformer
+    forward pass is a serial dependency chain -- layer N+1 consumes layer N's
+    output. Splitting a chain across devices adds transfers without creating
+    concurrency. Speedup would require either independent work (see
+    ConcurrentStreams) or reduced bytes per token (see Speculative).
+
+    Measured anyway, because "the docs imply it won't help" is weaker evidence
+    than a number from this machine.
+    """
+
+    name = "distributed"
+
+    @staticmethod
+    def configs(available: set[str], models: dict) -> list[dict]:
+        out = []
+        pairs = [(a, b) for a, b in (("NPU", "CPU"), ("GPU", "CPU"), ("CPU", "NPU"))
+                 if a in available and b in available]
+        for a, b in pairs:
+            key = pick_model(a, models) or pick_model(b, models)
+            if not key:
+                continue
+            for policy in ("PIPELINE_PARALLEL", "TENSOR_PARALLEL"):
+                out.append({"order": [a, b], "policy": policy, "model_key": key})
+        return out
+
+    @staticmethod
+    def run(cfg: dict, models: dict) -> RunResult:
+        import openvino_genai as ov_genai
+
+        order, policy = cfg["order"], cfg["policy"]
+        dev = "HETERO:" + ",".join(resolve(d) for d in order)
+        label = f"{policy} {'+'.join(order)}"
+        try:
+            t0 = time.perf_counter()
+            pipe = ov_genai.LLMPipeline(models[cfg["model_key"]], dev,
+                                        MODEL_DISTRIBUTION_POLICY={policy})
+            compile_s = time.perf_counter() - t0
+            res = pipe.generate([PROMPT], _gen_config())
+            out = _collect(res, compile_s, "distributed", label, dev)
+            out.extra["policy"] = policy
+            return out
+        except Exception as e:
+            return RunResult("distributed", label, dev, ok=False,
+                             error=f"{type(e).__name__}: {e}")
+
+
 ALL = [SingleDevice, Speculative, PrefillDecodeSplit,
-       ConcurrentStreams, CpuThreadPartition, Hetero]
+       ConcurrentStreams, CpuThreadPartition, Hetero, Distributed]
 BY_NAME = {s.name: s for s in ALL}
