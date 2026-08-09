@@ -129,6 +129,7 @@ def main() -> int:
 
     ok.sort(key=sort_key)
 
+    suspicious: list[tuple[str, float]] = []
     hdr = (f"{'strategy':<14} {'label':<34} {'tok/s':>9} {'+/-':>7} "
            f"{'%roof':>6} {'TTFT ms':>9} {'TPOT ms':>8} {'accept':>7} {'n':>3}")
     print(hdr)
@@ -147,13 +148,32 @@ def main() -> int:
         ttft = _f(r, "ttft_ms_mean")
         tpot = _f(r, "tpot_ms_mean")
         tag = "*" if agg else " "
+        # A decode row above its own ceiling is not a great result -- it is
+        # proof the row did not run the precision its filename claims. The GPU
+        # plugin converting an fp32 IR to f16 produces exactly this signature.
+        flag = "!" if (pct is not None and pct > 105) else ""
+        if flag:
+            suspicious.append((r.get("label", ""), pct))
         print(f"{r.get('strategy', ''):<14} {r.get('label', '')[:34]:<34} "
               f"{shown:>8.2f}{tag} {sd if sd is not None else 0:>7.2f} "
-              f"{(f'{pct:.0f}%' if pct is not None else '-'):>6} "
+              f"{(f'{pct:.0f}%{flag}' if pct is not None else '-'):>6} "
               f"{(f'{ttft:.0f}' if ttft else '-'):>9} "
               f"{(f'{tpot:.1f}' if tpot else '-'):>8} "
               f"{(f'{acc:.2f}' if acc is not None else '-'):>7} "
               f"{r.get('n', ''):>3}")
+
+    if suspicious:
+        print()
+        print("! ABOVE ITS OWN CEILING -- these rows did not execute at the precision")
+        print("  their model name implies, so the tok/s is real but the label is not:")
+        for lbl, p in suspicious:
+            print(f"    {lbl:<40} {p:.0f}% of ceiling")
+        print("  Most likely cause: INFERENCE_PRECISION_HINT defaults to f16 on the")
+        print("  GPU plugin, so an fp32 IR is converted down at compile time and")
+        print("  streams half the bytes. Confirm with:")
+        print("    python -m bench.kernels --model <fp32 model> --device GPU")
+        print("  and compare the 'runtime precision' counts. Re-run with a forced")
+        print("  hint to obtain a genuine fp32 measurement.")
 
     if any(_f(r, "aggregate_tok_s_mean") for r in ok):
         print()
@@ -172,7 +192,13 @@ def main() -> int:
         print("  are expected to fail on some configurations, and knowing exactly")
         print("  how they fail is part of the result.")
 
-    decode = [r for r in ok if r.get("strategy") in ("single", "cpu_threads")]
+    # Exclude rows flagged as above their own ceiling: they did not run the
+    # precision claimed, so naming one "best" would advertise a mislabelled
+    # measurement as the headline result.
+    flagged = {lbl for lbl, _ in suspicious}
+    decode = [r for r in ok
+              if r.get("strategy") in ("single", "cpu_threads")
+              and r.get("label", "") not in flagged]
     if peak and decode:
         best = decode[0]
         v = _f(best, "throughput_tok_s_mean")

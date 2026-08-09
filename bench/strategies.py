@@ -189,6 +189,16 @@ class SingleDevice:
                 continue
             for key in all_models(models):     # fp32 AND fp16, both measured
                 out.append({"device": kind, "model_key": key})
+                # An fp32 IR does NOT imply fp32 execution. The GPU plugin
+                # defaults INFERENCE_PRECISION_HINT to f16 and silently converts
+                # the weights down at compile time -- measured on Iris Xe, an
+                # fp32 IR ran with 625 nodes at f16 and only 10 at f32, giving a
+                # throughput identical to the fp16 model. Forcing the hint is the
+                # only way to obtain a genuine fp32 number, so measure both and
+                # let the difference be visible.
+                if key.endswith("fp32"):
+                    out.append({"device": kind, "model_key": key,
+                                "inference_precision": "f32"})
         return out
 
     @staticmethod
@@ -198,13 +208,19 @@ class SingleDevice:
         dev = cfg["device"]
         dev_str = resolve(dev)
         path = models[cfg["model_key"]]
-        label = f"{dev}/{cfg['model_key']}"
+        forced = cfg.get("inference_precision")
+        label = f"{dev}/{cfg['model_key']}" + (f" forced={forced}" if forced else "")
+        props = device_props(dev)
+        if forced:
+            props["INFERENCE_PRECISION_HINT"] = forced
         try:
             t0 = time.perf_counter()
-            pipe = ov_genai.LLMPipeline(path, dev_str, **device_props(dev))
+            pipe = ov_genai.LLMPipeline(path, dev_str, **props)
             compile_s = time.perf_counter() - t0
             res = pipe.generate([PROMPT], _gen_config())
-            return _collect(res, compile_s, "single", label, dev_str)
+            out = _collect(res, compile_s, "single", label, dev_str)
+            out.extra["inference_precision"] = forced or "device default"
+            return out
         except Exception as e:
             return RunResult("single", label, dev, ok=False, error=f"{type(e).__name__}: {e}")
 
