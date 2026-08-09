@@ -1,0 +1,6 @@
+﻿.venv/
+models/
+results/*.csv
+__pycache__/
+*.pyc
+_probe.py
