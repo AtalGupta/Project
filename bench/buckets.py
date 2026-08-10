@@ -33,8 +33,48 @@ UNIT = "The system streams model weights from memory for every token. "
 
 
 def prompt_of(n_tokens: int) -> str:
-    """Roughly n_tokens worth of text. Exact count is read back from metrics."""
-    return (UNIT * (n_tokens // 10 + 2))[:n_tokens * 5]
+    """Character-estimate fallback, only used if no tokenizer is available.
+
+    Deliberately UNDER-shoots: the NPU hard-fails when a prompt exceeds
+    MAX_PROMPT_LEN, so overshooting kills the run. 3 chars/token is below the
+    ~3.7 this repetitive text actually achieves.
+    """
+    return (UNIT * (n_tokens // 5 + 2))[:max(1, n_tokens * 3)]
+
+
+def prompt_exact(pipe, n_tokens: int) -> tuple[str, int]:
+    """Text that encodes to AT MOST n_tokens, plus the real count.
+
+    Estimating tokens from character length was the original bug: at a target of
+    64 it produced 86 real tokens, and at 128 it produced enough to breach a
+    128-token bucket and abort the sweep. Ask the tokenizer instead of guessing,
+    then trim until it genuinely fits.
+    """
+    try:
+        tok = pipe.get_tokenizer()
+    except Exception:
+        return prompt_of(n_tokens), -1
+
+    def count(txt: str) -> int:
+        try:
+            return int(tok.encode(txt).input_ids.get_shape()[-1])
+        except Exception:
+            return -1
+
+    text = UNIT * (n_tokens // 5 + 4)
+    n = count(text)
+    if n < 0:
+        return prompt_of(n_tokens), -1
+
+    # Shrink by character ratio, then walk down. Converges in 2-3 steps.
+    for _ in range(12):
+        n = count(text)
+        if n <= n_tokens:
+            break
+        text = text[:max(1, int(len(text) * (n_tokens / n) * 0.97))]
+    while count(text) > n_tokens and len(text) > 8:
+        text = text[:int(len(text) * 0.9)]
+    return text, count(text)
 
 
 def measure(model_dir: str, device: str, bucket: int, prompt_tokens: int,
@@ -55,7 +95,31 @@ def measure(model_dir: str, device: str, bucket: int, prompt_tokens: int,
     cfg.do_sample = False
     cfg.ignore_eos = True
 
-    text = prompt_of(prompt_tokens)
+    # LLMPipeline wraps the prompt in a chat template before encoding, so the
+    # tokenizer's count of the raw text UNDERSTATES what the model actually
+    # receives -- measured at ~21-26 extra tokens here. Ignoring that produced
+    # 90 real tokens for a 64-token target and blew past a 128 bucket.
+    # Probe the overhead once, then size the prompt against the real budget.
+    overhead = 0
+    try:
+        probe_text, probe_raw = prompt_exact(pipe, 8)
+        probe_cfg = ov_genai.GenerationConfig()
+        probe_cfg.max_new_tokens = 1
+        probe_cfg.do_sample = False
+        pr = pipe.generate([probe_text], probe_cfg)
+        overhead = max(0, pr.perf_metrics.get_num_input_tokens() - max(probe_raw, 0))
+    except Exception:
+        overhead = 0
+
+    text, planned = prompt_exact(pipe, max(1, prompt_tokens - overhead))
+    effective = planned + overhead
+    if effective > bucket:
+        del pipe
+        gc.collect()
+        return {"error": f"prompt is {effective} tokens after chat template "
+                         f"(+{overhead}), exceeds bucket {bucket}",
+                "compile_s": compile_s}
+
     ttfts, ntok = [], 0
     try:
         pipe.generate([text], cfg)          # warmup, discarded
