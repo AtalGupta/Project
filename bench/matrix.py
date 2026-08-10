@@ -97,8 +97,19 @@ def run_cell(pipe, text: str, n_out: int, reps: int, warmup: int = 3) -> dict:
     # while leaving ITL roughly correct. Reference runs that sweep warmup counts
     # show TTFT settling by about the fifth iteration; a single warmup measured
     # 534 ms where a warm run gives ~190 ms for the same prompt.
+    #
+    # But warming does not require GENERATING the full output -- it only has to
+    # touch the weights. So do the repeated warmups with a 1-token generation
+    # (cheap, and it exercises exactly the prefill path TTFT measures), then one
+    # full-length pass so the decode loop is warm too. At output=512 this turns
+    # ~2 minutes of warmup per cell into ~25 seconds.
+    warm_cfg = ov_genai.GenerationConfig()
+    warm_cfg.max_new_tokens = 1
+    warm_cfg.do_sample = False
+    warm_cfg.ignore_eos = True
     for _ in range(max(1, warmup)):
-        pipe.generate([text], cfg)
+        pipe.generate([text], warm_cfg)
+    pipe.generate([text], cfg)          # one full-length pass, discarded
     ttfts, itls, ntok = [], [], 0
     for _ in range(reps):
         res = pipe.generate([text], cfg)
