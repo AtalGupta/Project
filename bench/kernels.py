@@ -97,7 +97,59 @@ def _first(node, keys, default: str = "?") -> str:
     return default
 
 
-def inspect(model_dir: str, device: str, props: dict | None = None) -> dict:
+def make_static(model, seq: int = 1, past: int = 1024, batch: int = 1) -> str:
+    """Bind every dynamic dimension to a concrete size.
+
+    The NPU compiler cannot consume unbounded dynamic shapes -- an exported LLM
+    IR has `?` for batch and sequence, which surface as INT64_MAX bounds and
+    fail with "to_shape was called on a dynamic shape".
+
+    GenAI's LLMPipeline does this reshaping internally from MAX_PROMPT_LEN /
+    MIN_RESPONSE_LEN, which is why the pipeline can target the NPU while a raw
+    Core.compile_model() on the same IR cannot. This reproduces that step so the
+    executable graph can be inspected the same way it can on CPU and GPU.
+
+    Dimension roles are inferred from input names, since an LLM IR follows a
+    stable convention:
+        input_ids / position_ids   [batch, seq]
+        attention_mask             [batch, past + seq]
+        beam_idx                   [batch]
+        past_key_values.N.key|value [batch, kv_heads, past, head_dim]
+    """
+    from openvino import PartialShape
+
+    shapes = {}
+    for inp in model.inputs:
+        try:
+            name = inp.get_any_name()
+        except Exception:
+            name = ""
+        ps = inp.get_partial_shape()
+        low = name.lower()
+        dims = []
+        dyn_seen = 0
+        for d in ps:
+            if d.is_static:
+                dims.append(d.get_length())
+                continue
+            if "beam_idx" in low:
+                dims.append(batch)
+            elif "past_key_value" in low or "present" in low:
+                # first dynamic is batch, second is the accumulated KV length
+                dims.append(batch if dyn_seen == 0 else past)
+            elif "attention_mask" in low:
+                dims.append(batch if dyn_seen == 0 else past + seq)
+            else:                       # input_ids, position_ids, ...
+                dims.append(batch if dyn_seen == 0 else seq)
+            dyn_seen += 1
+        shapes[name] = PartialShape(dims)
+
+    model.reshape(shapes)
+    return ", ".join(f"{k}{list(v.to_shape())}" for k, v in list(shapes.items())[:4])
+
+
+def inspect(model_dir: str, device: str, props: dict | None = None,
+            static: bool | None = None, seq: int = 1, past: int = 1024) -> dict:
     from bench.devices import core  # shared singleton; see devices.core()
 
     c = core()
@@ -107,6 +159,14 @@ def inspect(model_dir: str, device: str, props: dict | None = None) -> dict:
 
     print(f"reading  : {xml}", flush=True)
     model = c.read_model(xml)
+
+    # NPU cannot compile unbounded dynamic shapes; default to reshaping there.
+    if static is None:
+        static = device.upper().startswith("NPU")
+    if static:
+        shown = make_static(model, seq=seq, past=past)
+        print(f"reshaped : static seq={seq} past={past}  [{shown} ...]", flush=True)
+
     print(f"compiling: device={device} props={props or {}}", flush=True)
     compiled = c.compile_model(model, device, props or {})
     print("inspecting executable graph ...", flush=True)
@@ -210,6 +270,14 @@ def main() -> int:
     ap.add_argument("--device", default="CPU", help="CPU / GPU / NPU (kind or exact name)")
     ap.add_argument("--fp16", action="store_true",
                     help="request INFERENCE_PRECISION_HINT=f16")
+    ap.add_argument("--static", action="store_true",
+                    help="bind dynamic dims to static sizes (automatic for NPU)")
+    ap.add_argument("--dynamic", action="store_true",
+                    help="force dynamic shapes even on NPU (will fail; for diagnosis)")
+    ap.add_argument("--seq", type=int, default=1,
+                    help="sequence length when reshaping (1 = decode step)")
+    ap.add_argument("--past", type=int, default=1024,
+                    help="KV-cache length when reshaping")
     args = ap.parse_args()
 
     dev = devmod.pick(args.device.split(".")[0]) or args.device
@@ -224,7 +292,9 @@ def main() -> int:
         print("      doubles bytes-per-token on a bandwidth-bound decode.")
         print()
 
-    return report(inspect(args.model, dev, props))
+    static = True if args.static else (False if args.dynamic else None)
+    return report(inspect(args.model, dev, props, static=static,
+                          seq=args.seq, past=args.past))
 
 
 if __name__ == "__main__":
