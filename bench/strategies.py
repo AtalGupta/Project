@@ -617,6 +617,60 @@ class Distributed:
 # No Speculative, no quantised variants anywhere. Every strategy here runs the
 # SAME unmodified fp32 model, so differences between rows are differences in the
 # hardware and the runtime -- not in the workload.
-ALL = [SingleDevice, PrefillScaling, PrefillDecodeSplit,
+class OpSplit:
+    """Compute-bound ops on one device, memory-bound ops on the other.
+
+    Uses HETERO manual affinity, annotated by bench/opsplit.py from the
+    per-op scaling measured by bench/profile.py. Run bench.opsplit first to
+    produce the `-split` model directory.
+
+    The measured split for Qwen2.5-1.5B: 28 ScaledDotProductAttention nodes
+    (compute, slope 1.20) on one device, all 197 weighted MatMuls -- the
+    FullyConnected layers, 95% of decode time, slope 0.36 -- on the other,
+    with 171 device crossings in the graph.
+
+    Expected to lose, for a reason visible in that crossing count: SDPA and the
+    weighted MatMuls are sequentially dependent inside every decoder layer, so
+    the boundary is crossed ~6 times per layer, every token, and HETERO runs
+    subgraphs one after another. The transfers are pure added latency, not
+    overlapped work. Measured so the claim has a number behind it.
+    """
+
+    name = "op_split"
+
+    @staticmethod
+    def configs(available: set[str], models: dict) -> list[dict]:
+        out = []
+        for key in list(models):
+            if not key.endswith("-split"):
+                continue
+            for compute, memory in (("NPU", "CPU"), ("GPU", "CPU"),
+                                    ("CPU", "NPU"), ("CPU", "GPU")):
+                if compute in available and memory in available:
+                    out.append({"model_key": key, "compute": compute,
+                                "memory": memory})
+        return out
+
+    @staticmethod
+    def run(cfg: dict, models: dict) -> RunResult:
+        import openvino_genai as ov_genai
+
+        compute, memory = cfg["compute"], cfg["memory"]
+        dev = f"HETERO:{resolve(compute)},{resolve(memory)}"
+        label = f"compute={compute} memory={memory}"
+        try:
+            t0 = time.perf_counter()
+            pipe = ov_genai.LLMPipeline(models[cfg["model_key"]], dev)
+            compile_s = time.perf_counter() - t0
+            res = pipe.generate([PROMPT], _gen_config())
+            out = _collect(res, compile_s, "op_split", label, dev)
+            out.extra.update({"compute_device": compute, "memory_device": memory})
+            return out
+        except Exception as e:
+            return RunResult("op_split", label, dev, ok=False,
+                             error=f"{type(e).__name__}: {e}")
+
+
+ALL = [SingleDevice, PrefillScaling, PrefillDecodeSplit, OpSplit,
        ConcurrentStreams, CpuThreadPartition, Hetero, Distributed]
 BY_NAME = {s.name: s for s in ALL}

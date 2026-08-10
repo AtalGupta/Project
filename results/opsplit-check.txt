@@ -1,0 +1,70 @@
+﻿==============================================================================
+SPLIT      attention=CPU  FFN=GPU
+           device string: HETERO:GPU.0,CPU
+REFERENCE  GPU.0  (models/qwen2.5-1.5b-fp16)
+==============================================================================
+
+split model compiled in 12.3s
+reference compiled in 9.0s
+
+==============================================================================
+MODEL OUTPUT  (correctness before any timing)
+==============================================================================
+
+--- prompt 1: What is 17 * 23? Answer with the number only.
+
+  [SPLIT  CPU+GPU]
+    391
+
+  [REF    GPU.0]
+    391
+
+  -> IDENTICAL
+
+--- prompt 2: Explain in two sentences why memory bandwidth limits LLM token generation.
+
+  [SPLIT  CPU+GPU]
+    Memory bandwidth limits the rate at which a language model can access and process information, which in turn affects the speed and efficiency of token generation.
+
+  [REF    GPU.0]
+    Memory bandwidth limits the rate at which a language model can access and process information, which in turn affects the speed and efficiency of token generation.
+
+  -> IDENTICAL
+
+--- prompt 3: Write a Python function that reverses a linked list.
+
+  [SPLIT  CPU+GPU]
+    Certainly! Below is a Python function that reverses a singly linked list. The function uses an iterative approach to reverse the list.
+    
+    ```python
+    class ListNode:
+        def __init__(self, value=0, next=None):
+            self
+
+  [REF    GPU.0]
+    Certainly! Below is a Python function that reverses a singly linked list. The function uses an iterative approach to reverse the list.
+    
+    ```python
+    class ListNode:
+        def __init__(self, value=0, next=None):
+            self
+
+  -> IDENTICAL
+
+==============================================================================
+CORRECTNESS: OK — split output matches or diverges only late.
+==============================================================================
+
+BENCHMARK  (TTFT = prompt processing, ITL = per-token generation)
+
+config                    in   out     TTFT ms    ITL ms    tok/s
+-----------------------------------------------------------------
+SPLIT                    128   128        98.4     61.22    16.33
+SPLIT                    512   128       107.3     62.95    15.88
+SPLIT                   1024   128        93.9     57.83    17.29
+REF GPU.0                128   128        86.1     56.31    17.76
+REF GPU.0                512   128        74.0     56.77    17.61
+REF GPU.0               1024   128        91.1     56.90    17.58
+
+ITL is the number to compare against a CPU-only reference: it is
+the steady-state generation cost, unaffected by prompt length.

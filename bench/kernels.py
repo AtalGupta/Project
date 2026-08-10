@@ -167,6 +167,46 @@ def inspect(model_dir: str, device: str, props: dict | None = None,
         shown = make_static(model, seq=seq, past=past)
         print(f"reshaped : static seq={seq} past={past}  [{shown} ...]", flush=True)
 
+    # A stateful IR keeps its KV cache in ReadValue/Assign variables rather than
+    # in Parameters. model.reshape() only rebinds Parameters, so the cache stays
+    # dynamic and the NPU compiler still fails with "to_shape was called on a
+    # dynamic shape" -- the reshape above cannot fix it.
+    #
+    # GenAI's NPU path solves this with NPUW transformations driven by
+    # MAX_PROMPT_LEN / MIN_RESPONSE_LEN, which is not reproducible with a few
+    # public API calls. So: detect it and say so, rather than emit a traceback
+    # that looks like a hardware verdict when it is a tooling limit.
+    # `sinks` is a property in some builds and `get_sinks()` a method in others.
+    n_state = 0
+    for accessor in ("get_sinks", "sinks"):
+        try:
+            v = getattr(model, accessor)
+            v = v() if callable(v) else v
+            n_state = len(v or [])
+            break
+        except Exception:
+            continue
+    if n_state and device.upper().startswith("NPU"):
+        raise SystemExit(
+            f"\nCannot inspect NPU kernels for this model: the IR is STATEFUL\n"
+            f"  ({n_state} ReadValue/Assign pairs hold the KV cache as internal\n"
+            f"  state with dynamic shape, and model.reshape() only rebinds inputs).\n"
+            f"\n"
+            f"  This is a limitation of raw Core.compile_model(), NOT a statement\n"
+            f"  about whether the NPU can run the model. GenAI's LLMPipeline applies\n"
+            f"  NPUW static transformations that this path does not.\n"
+            f"\n"
+            f"  To get the actual NPU decode measurement:\n"
+            f"    python -u -m bench.run --strategy single --reps 3 "
+            f"--out results\\cloud-single.csv\n"
+            f"\n"
+            f"  To inspect NPU kernels specifically, re-export without state:\n"
+            f"    optimum-cli export openvino --model Qwen/Qwen2.5-1.5B-Instruct \\\n"
+            f"        --task text-generation-with-past --disable-stateful \\\n"
+            f"        --weight-format fp32 models/qwen2.5-1.5b-fp32-nostate\n"
+            f"  then run this tool against that directory. Note the non-stateful\n"
+            f"  graph is not what you would deploy -- it is a diagnostic only.\n")
+
     print(f"compiling: device={device} props={props or {}}", flush=True)
     compiled = c.compile_model(model, device, props or {})
     print("inspecting executable graph ...", flush=True)
