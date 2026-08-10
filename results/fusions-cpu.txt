@@ -1,0 +1,67 @@
+﻿  compiling on CPU ...
+
+==============================================================================
+GRAPH COLLAPSE on CPU
+==============================================================================
+  IR graph            4248 nodes
+  executable graph    1424 nodes   (2824 removed, -66.5%)
+  stateful          56 ReadValue/Assign pairs (KV cache)
+
+FIRED — node types created by compilation (did not exist in the IR)
+------------------------------------------------------------------------------
+    197x  FullyConnected
+          <- convert_matmul_to_fc (+ fc_bias_fusion)  [CPU/GPU plugin]  (strong attribution)
+             MatMul with constant weights -> FullyConnected, bias folded in
+     57x  RMS
+          <- rms_fusion  [common]  (strong attribution)
+             pow/mean/sqrt/div/mul chain -> one RMS node
+     56x  RoPE
+          <- fuse_rotary_positional_embeddings  [common]  (strong attribution)
+             sin/cos/slice/concat chain -> one RoPE node
+      3x  Reorder
+          <- layout conversion insertion  [CPU plugin]  (strong attribution)
+             INSERTED, not fused — converts between memory layouts a kernel needs
+      2x  Math
+          <- unrecognised type; not in the PRODUCED_BY table
+
+CONSUMED — node types present in the IR, absent after compilation
+------------------------------------------------------------------------------
+    112x  Slice                        optimize_strided_slice
+     69x  Unsqueeze                    eliminate_unsqueeze_gather / nop_elimination
+      2x  Squeeze                      nop_elimination
+      2x  BitwiseAnd                   fused or eliminated (multiple passes possible)
+      1x  Cos                          fused or eliminated (multiple passes possible)
+      1x  Sin                          fused or eliminated (multiple passes possible)
+      1x  LessEqual                    fused or eliminated (multiple passes possible)
+      1x  ReduceProd                   fused or eliminated (multiple passes possible)
+      1x  Select                       fused or eliminated (multiple passes possible)
+
+REDUCED — survived, but far fewer
+------------------------------------------------------------------------------
+  Const                         1671 -> 662   (+1009)  partially fused
+  Eltwise                        767 -> 90    (+677)  partially fused
+  Convert                        572 -> 5     (+567)  compress_float_constants / precision folding
+  MatMul                         198 -> 1     (+197)  convert_matmul_to_fc — consumed into FullyConnected
+  Concatenation                  173 -> 5     (+168)  partially fused
+  Broadcast                      114 -> 3     (+111)  broadcast_elementwise_fusion
+  Gather                          64 -> 6     (+58)  partially fused
+  Reduce                          57 -> 1     (+56)  partially fused
+  Transpose                      113 -> 57    (+56)  transpose_fusion, matmul_const_transposes_extraction
+  Reshape                        173 -> 124   (+49)  sink_reshape, optimize_subsequent_reshapes, nop_elimination
+
+DID NOT FIRE — offered by OpenVINO, but no output node present here
+------------------------------------------------------------------------------
+  stateful_sdpa_fusion                       [CPU plugin]
+    would produce `ScaledDotProductAttentionWithKVCache` — stateful attention
+  glu_fusion / swiglu_fusion_with_clamp      [common / GPU]
+    would produce `SwiGLU` — FFN gate (gate * SiLU(up))
+  Snippets tokenization                      [Snippets]
+    would produce `Subgraph` — JIT-compiled subgraph
+  kv_cache_fusion                            [GPU plugin]
+    would produce `KVCache` — KV cache as one node
+  paged attention                            [common]
+    would produce `PagedAttention` — paged KV cache
+
+Attribution is INFERRED from node-type signatures, not reported by the
+compiler. 'strong' means the type is distinctive; 'weak' means several
+passes could account for it.
