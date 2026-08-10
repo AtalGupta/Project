@@ -84,7 +84,7 @@ def build_pipe(model_dir: str, device: str, bucket: int, min_response: int):
     return pipe, time.perf_counter() - t0
 
 
-def run_cell(pipe, text: str, n_out: int, reps: int) -> dict:
+def run_cell(pipe, text: str, n_out: int, reps: int, warmup: int = 3) -> dict:
     import openvino_genai as ov_genai
 
     cfg = ov_genai.GenerationConfig()
@@ -92,7 +92,13 @@ def run_cell(pipe, text: str, n_out: int, reps: int) -> dict:
     cfg.do_sample = False
     cfg.ignore_eos = True            # fixed token count, else ITL is unstable
 
-    pipe.generate([text], cfg)       # warmup, discarded
+    # TTFT needs several warmups, not one. A 3.1 GB model is still paging into
+    # resident memory on the first inferences, which inflates time-to-first-token
+    # while leaving ITL roughly correct. Reference runs that sweep warmup counts
+    # show TTFT settling by about the fifth iteration; a single warmup measured
+    # 534 ms where a warm run gives ~190 ms for the same prompt.
+    for _ in range(max(1, warmup)):
+        pipe.generate([text], cfg)
     ttfts, itls, ntok = [], [], 0
     for _ in range(reps):
         res = pipe.generate([text], cfg)
@@ -148,6 +154,8 @@ def main() -> int:
     ap.add_argument("--configs", nargs="*", default=None,
                     help="subset: cpu npu split gpu split_gpu")
     ap.add_argument("--reps", type=int, default=3)
+    ap.add_argument("--warmup", type=int, default=3,
+                    help="discarded iterations before timing; TTFT needs >=3")
     ap.add_argument("--csv", default=os.path.join(ROOT, "results", "matrix.csv"))
     ap.add_argument("--no-resume", action="store_true")
     args = ap.parse_args()
@@ -231,7 +239,7 @@ def main() -> int:
                        "input_len": n_in, "output_len": o, "reps": args.reps,
                        "compile_s": round(compile_s, 1)}
                 try:
-                    row.update(run_cell(pipe, text, o, args.reps))
+                    row.update(run_cell(pipe, text, o, args.reps, args.warmup))
                     print(f" TTFT {row['ttft_ms']:8.1f}  ITL {row['itl_ms']:6.2f}"
                           f"  e2e {row['e2e_ms']/1000:7.2f}s")
                 except Exception as e:
